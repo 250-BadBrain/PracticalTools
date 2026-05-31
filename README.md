@@ -9,3 +9,5 @@ Clicker: 连点器
 Hide: 隐藏文件（也没有那么隐藏
 
 PortChecker: 端口检查工具
+
+InvisibleCompiler: 隐形 C / C++ 编译器
