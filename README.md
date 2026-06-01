@@ -14,6 +14,8 @@ InvisibleCompiler: 看不见的编译器
 
 DiskSniffer: 磁盘占用可视化工具
 
+WindowOpacity: 窗口不透明度调节工具
+
 ## 开源协议
 
 GPL-3.0
