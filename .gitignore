@@ -1,2 +1,5 @@
 # Build
 dist/
+
+# Local publish helper
+scripts/publish-releases.ps1

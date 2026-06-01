@@ -6,6 +6,7 @@ set "BASE_LDFLAGS=-s -w"
 
 if not "%~1"=="" (
   if /i "%~1"=="all" goto build_all
+  if /i "%~1"=="release" goto build_release
   if /i "%~1"=="cli" goto args_with_mode
   if /i "%~1"=="browser" goto args_with_mode
   if /i "%~1"=="native" goto args_with_mode
@@ -41,6 +42,7 @@ goto choose_os
 
 :args_with_mode
 set "BUILD_MODE=%~1"
+if /i "%~2"=="all" goto build_mode_all
 set "TARGET_OS=%~2"
 set "TARGET_ARCH=%~3"
 goto build_one
@@ -186,18 +188,26 @@ echo Build finished.
 exit /b 0
 
 :build_all
+call "%~f0" cli all || exit /b 1
+call "%~f0" browser all || exit /b 1
+call "%~f0" native windows amd64 || exit /b 1
+echo Build finished.
+exit /b 0
+
+:build_release
 call "%~f0" cli windows amd64 || exit /b 1
 call "%~f0" browser windows amd64 || exit /b 1
 call "%~f0" native windows amd64 || exit /b 1
 call "%~f0" browser linux amd64 || exit /b 1
 call "%~f0" browser linux arm64 || exit /b 1
-echo Build finished.
+echo Release build finished.
 exit /b 0
 
 :usage
 echo Usage:
 echo   build.bat
 echo   build.bat all
+echo   build.bat release
 echo   build.bat cli windows amd64
 echo   build.bat browser linux arm64
 echo   build.bat native windows amd64

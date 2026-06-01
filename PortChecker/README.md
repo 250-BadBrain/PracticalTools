@@ -52,6 +52,7 @@ build.bat browser windows amd64
 build.bat browser linux arm64
 build.bat native windows amd64
 build.bat all
+build.bat release
 ```
 
 Linux / macOS：
@@ -63,9 +64,12 @@ sh build.sh browser windows amd64
 sh build.sh browser linux arm64
 sh build.sh native linux amd64
 sh build.sh all
+sh build.sh release
 ```
 
 不带参数运行构建脚本时，会先选择构建模式，再选择操作系统和架构。
+
+`all` 会构建 CLI 和浏览器 GUI 的全部 Windows / Linux 架构，并构建当前环境支持的原生 GUI。`release` 只构建常用发布产物。
 
 构建产物：
 

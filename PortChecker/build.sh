@@ -80,12 +80,20 @@ build_mode_all() {
 }
 
 if [ "${1:-}" = "all" ]; then
+  build_mode_all cli
+  build_mode_all browser
+  build_one native "$(uname -s | tr '[:upper:]' '[:lower:]' | sed 's/linux.*/linux/')" "$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/;s/i686/386/;s/i386/386/')"
+  echo "Build finished."
+  exit 0
+fi
+
+if [ "${1:-}" = "release" ]; then
   build_one cli windows amd64
   build_one browser windows amd64
   build_one native windows amd64
   build_one browser linux amd64
   build_one browser linux arm64
-  echo "Build finished."
+  echo "Release build finished."
   exit 0
 fi
 

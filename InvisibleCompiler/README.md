@@ -37,13 +37,23 @@ Windows：
 
 ```bat
 build.bat
+build.bat all
+build.bat release
+build.bat windows amd64
+build.bat linux arm64
 ```
 
 Linux / macOS：
 
 ```bash
 sh build.sh
+sh build.sh all
+sh build.sh release
+sh build.sh windows amd64
+sh build.sh linux arm64
 ```
+
+`all` 会构建全部 Windows / Linux 架构。`release` 只构建常用发布产物。
 
 ## 依赖
 
