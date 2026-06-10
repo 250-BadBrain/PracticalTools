@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cwctype>
@@ -18,6 +19,7 @@ enum class ClickMode {
     MouseRight = 1,
     MouseMiddle = 2,
     Keyboard = 3,
+    MouseMove = 4,
 };
 
 struct ActionSpec {
@@ -26,6 +28,9 @@ struct ActionSpec {
     UINT scanCode = 0;
     bool extended = false;
     bool keyReady = false;
+    int x = -1;
+    int y = -1;
+    DWORD delayMs = 0;
 };
 
 constexpr int kEditCpsId = 1001;
@@ -42,8 +47,11 @@ constexpr int kEditKeyId = 1011;
 constexpr int kComboListId = 1012;
 constexpr int kComboAddId = 1013;
 constexpr int kComboRemoveId = 1014;
+constexpr int kComboClearId = 1015;
+constexpr int kRecordButtonId = 1016;
 constexpr int kHotkeyToggleId = 1;
 constexpr int kHotkeyQuitId = 2;
+constexpr int kHotkeyRecordId = 3;
 constexpr int kAppIconId = 101;
 
 HWND g_mainWindow = nullptr;
@@ -58,6 +66,8 @@ HWND g_radioKeyboard = nullptr;
 HWND g_comboListBox = nullptr;
 HWND g_comboAddButton = nullptr;
 HWND g_comboRemoveButton = nullptr;
+HWND g_comboClearButton = nullptr;
+HWND g_recordButton = nullptr;
 HWND g_statusText = nullptr;
 HFONT g_uiFont = nullptr;
 WNDPROC g_oldCpsEditProc = nullptr;
@@ -65,6 +75,7 @@ WNDPROC g_oldKeyEditProc = nullptr;
 bool g_capturingKey = false;
 bool g_normalizingCps = false;
 std::atomic<bool> g_running{false};
+std::atomic<bool> g_recording{false};
 std::atomic<bool> g_shouldExit{false};
 std::atomic<int> g_operationMode{static_cast<int>(OperationMode::Single)};
 std::atomic<int> g_clickMode{static_cast<int>(ClickMode::MouseLeft)};
@@ -75,8 +86,15 @@ std::atomic<bool> g_keyCaptured{false};
 ActionSpec g_singleAction;
 std::vector<ActionSpec> g_comboSteps;
 std::vector<ActionSpec> g_runtimeActions;
+std::vector<ActionSpec> g_recordedActions;
+std::mutex g_recordMutex;
 int g_selectedComboIndex = -1;
 std::thread g_clickThread;
+HHOOK g_mouseHook = nullptr;
+HHOOK g_keyboardHook = nullptr;
+DWORD g_lastRecordTick = 0;
+POINT g_lastRecordedMousePoint{};
+bool g_hasRecordedMousePoint = false;
 
 bool IsKeyboardMode();
 void BuildStatusMessage(const wchar_t* prefix);
@@ -90,6 +108,8 @@ void EnsureComboStepsExist();
 void RefreshComboListBox();
 void ApplyOperationMode(OperationMode mode);
 bool BuildRuntimeActions();
+void StopClicker();
+void ToggleRecording();
 
 std::wstring Trim(const std::wstring& value) {
     size_t begin = 0;
@@ -256,6 +276,8 @@ std::wstring GetActionKindDisplayName(ClickMode kind) {
         return L"鼠标中键";
     case ClickMode::Keyboard:
         return L"键盘按键";
+    case ClickMode::MouseMove:
+        return L"鼠标移动";
     default:
         return L"未知";
     }
@@ -266,12 +288,17 @@ std::wstring FormatActionLabel(const ActionSpec& action) {
     case ClickMode::MouseLeft:
     case ClickMode::MouseRight:
     case ClickMode::MouseMiddle:
+        if (action.x >= 0 && action.y >= 0) {
+            return GetActionKindDisplayName(action.kind) + L" @ (" + std::to_wstring(action.x) + L", " + std::to_wstring(action.y) + L")";
+        }
         return GetActionKindDisplayName(action.kind);
     case ClickMode::Keyboard:
         if (!action.keyReady) {
             return L"键盘按键 - 未捕获";
         }
         return std::wstring(L"键盘 ") + GetCapturedKeyDisplayName(action.vk, action.scanCode, action.extended);
+    case ClickMode::MouseMove:
+        return L"移动到 (" + std::to_wstring(action.x) + L", " + std::to_wstring(action.y) + L")";
     }
 
     return L"未知";
@@ -305,6 +332,8 @@ void LoadActionIntoEditor(const ActionSpec& action) {
         SetWindowTextW(g_editKey, GetCapturedKeyDisplayName(action.vk, action.scanCode, action.extended).c_str());
     } else if (action.kind == ClickMode::Keyboard) {
         SetWindowTextW(g_editKey, L"点击后按键捕获");
+    } else if (action.kind == ClickMode::MouseMove) {
+        SetWindowTextW(g_editKey, L"鼠标轨迹点");
     }
 
     EnableWindow(g_editKey, action.kind == ClickMode::Keyboard);
@@ -318,6 +347,10 @@ void SaveEditorActionToModel() {
     }
 
     if (g_selectedComboIndex >= 0 && g_selectedComboIndex < static_cast<int>(g_comboSteps.size())) {
+        const ActionSpec& current = g_comboSteps[static_cast<size_t>(g_selectedComboIndex)];
+        if (current.kind == ClickMode::MouseMove || current.x >= 0 || current.y >= 0 || current.delayMs > 0) {
+            return;
+        }
         g_comboSteps[static_cast<size_t>(g_selectedComboIndex)] = action;
     }
 }
@@ -365,6 +398,7 @@ void ApplyOperationMode(OperationMode mode) {
     ShowWindow(g_comboListBox, comboVisible ? SW_SHOW : SW_HIDE);
     ShowWindow(g_comboAddButton, comboVisible ? SW_SHOW : SW_HIDE);
     ShowWindow(g_comboRemoveButton, comboVisible ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_comboClearButton, comboVisible ? SW_SHOW : SW_HIDE);
 
     RefreshComboListBox();
     UpdateModeUi();
@@ -407,6 +441,15 @@ void RemoveComboStep() {
 
     LoadActionIntoEditor(g_comboSteps[static_cast<size_t>(g_selectedComboIndex)]);
     RefreshComboListBox();
+}
+
+void ClearComboSteps() {
+    g_comboSteps.clear();
+    g_comboSteps.push_back(g_singleAction);
+    g_selectedComboIndex = 0;
+    LoadActionIntoEditor(g_comboSteps.front());
+    RefreshComboListBox();
+    BuildStatusMessage(L"状态: 已清空序列");
 }
 
 void NormalizeCpsText(HWND hwnd) {
@@ -609,20 +652,262 @@ void SendKeyboardClick(WORD vk, UINT scanCode, bool extended) {
     SendInput(2, inputs, sizeof(INPUT));
 }
 
-void SendAction(const ActionSpec& action) {
+RECT VirtualScreenRect() {
+    RECT rect{};
+    rect.left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    rect.top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    rect.right = rect.left + GetSystemMetrics(SM_CXVIRTUALSCREEN) - 1;
+    rect.bottom = rect.top + GetSystemMetrics(SM_CYVIRTUALSCREEN) - 1;
+    return rect;
+}
+
+POINT ClampToVirtualScreen(POINT point) {
+    const RECT rect = VirtualScreenRect();
+    point.x = std::clamp(point.x, rect.left, rect.right);
+    point.y = std::clamp(point.y, rect.top, rect.bottom);
+    return point;
+}
+
+void SendMouseMove(int x, int y) {
+    POINT point{x, y};
+    point = ClampToVirtualScreen(point);
+    SetCursorPos(point.x, point.y);
+}
+
+bool ShouldStopPlayback() {
+    return !g_running.load(std::memory_order_relaxed) || g_shouldExit.load(std::memory_order_relaxed);
+}
+
+bool InterruptibleSleep(DWORD milliseconds) {
+    DWORD elapsed = 0;
+    while (elapsed < milliseconds) {
+        if (ShouldStopPlayback()) {
+            return false;
+        }
+        const DWORD chunk = std::min<DWORD>(milliseconds - elapsed, 5);
+        std::this_thread::sleep_for(std::chrono::milliseconds(chunk));
+        elapsed += chunk;
+    }
+    return !ShouldStopPlayback();
+}
+
+bool SendAction(const ActionSpec& action) {
+    if (ShouldStopPlayback()) {
+        return false;
+    }
+
+    if (action.delayMs > 0 && !InterruptibleSleep(action.delayMs)) {
+        return false;
+    }
+
     switch (action.kind) {
     case ClickMode::MouseLeft:
+        if (action.x >= 0 && action.y >= 0) SendMouseMove(action.x, action.y);
         SendMouseClick(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP);
         break;
     case ClickMode::MouseRight:
+        if (action.x >= 0 && action.y >= 0) SendMouseMove(action.x, action.y);
         SendMouseClick(MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP);
         break;
     case ClickMode::MouseMiddle:
+        if (action.x >= 0 && action.y >= 0) SendMouseMove(action.x, action.y);
         SendMouseClick(MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP);
         break;
     case ClickMode::Keyboard:
         SendKeyboardClick(action.vk, action.scanCode, action.extended);
         break;
+    case ClickMode::MouseMove:
+        SendMouseMove(action.x, action.y);
+        break;
+    }
+
+    return !ShouldStopPlayback();
+}
+
+bool IsOwnWindowPoint(POINT point) {
+    HWND atPoint = WindowFromPoint(point);
+    return atPoint && (atPoint == g_mainWindow || IsChild(g_mainWindow, atPoint));
+}
+
+void AddRecordedAction(ActionSpec action) {
+    if (!g_recording.load(std::memory_order_relaxed)) {
+        return;
+    }
+
+    const DWORD now = GetTickCount();
+    std::lock_guard<std::mutex> lock(g_recordMutex);
+    if (!g_recordedActions.empty() && g_lastRecordTick != 0) {
+        action.delayMs = std::min<DWORD>(now - g_lastRecordTick, 3000);
+    }
+    g_lastRecordTick = now;
+    g_recordedActions.push_back(action);
+}
+
+bool ShouldRecordMouseMove(POINT point) {
+    const DWORD now = GetTickCount();
+    if (!g_hasRecordedMousePoint) {
+        g_lastRecordedMousePoint = point;
+        g_hasRecordedMousePoint = true;
+        return true;
+    }
+
+    const int dx = point.x - g_lastRecordedMousePoint.x;
+    const int dy = point.y - g_lastRecordedMousePoint.y;
+    const int distanceSquared = dx * dx + dy * dy;
+    if (distanceSquared < 16 && now - g_lastRecordTick < 15) {
+        return false;
+    }
+
+    g_lastRecordedMousePoint = point;
+    return true;
+}
+
+LRESULT CALLBACK MouseRecordProc(int code, WPARAM wParam, LPARAM lParam) {
+    if (code == HC_ACTION && g_recording.load(std::memory_order_relaxed)) {
+        const auto* mouse = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
+        POINT point = ClampToVirtualScreen(mouse->pt);
+        if (!(mouse->flags & LLMHF_INJECTED) && !IsOwnWindowPoint(point)) {
+            ActionSpec action;
+            bool captured = true;
+            switch (wParam) {
+            case WM_MOUSEMOVE:
+                if (!ShouldRecordMouseMove(point)) {
+                    captured = false;
+                    break;
+                }
+                action.kind = ClickMode::MouseMove;
+                action.x = point.x;
+                action.y = point.y;
+                break;
+            case WM_LBUTTONDOWN:
+                action.kind = ClickMode::MouseLeft;
+                action.x = point.x;
+                action.y = point.y;
+                break;
+            case WM_RBUTTONDOWN:
+                action.kind = ClickMode::MouseRight;
+                action.x = point.x;
+                action.y = point.y;
+                break;
+            case WM_MBUTTONDOWN:
+                action.kind = ClickMode::MouseMiddle;
+                action.x = point.x;
+                action.y = point.y;
+                break;
+            default:
+                captured = false;
+                break;
+            }
+            if (captured) {
+                AddRecordedAction(action);
+            }
+        }
+    }
+
+    return CallNextHookEx(g_mouseHook, code, wParam, lParam);
+}
+
+LRESULT CALLBACK KeyboardRecordProc(int code, WPARAM wParam, LPARAM lParam) {
+    if (code == HC_ACTION && g_recording.load(std::memory_order_relaxed)) {
+        const auto* key = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+        if (!(key->flags & LLKHF_INJECTED)
+            && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)
+            && key->vkCode != VK_F6 && key->vkCode != VK_F7 && key->vkCode != VK_F8
+            && GetForegroundWindow() != g_mainWindow) {
+            ActionSpec action;
+            action.kind = ClickMode::Keyboard;
+            action.vk = static_cast<WORD>(key->vkCode);
+            action.scanCode = key->scanCode;
+            action.extended = (key->flags & LLKHF_EXTENDED) != 0;
+            action.keyReady = true;
+            AddRecordedAction(action);
+        }
+    }
+
+    return CallNextHookEx(g_keyboardHook, code, wParam, lParam);
+}
+
+void InstallRecordHooks() {
+    HINSTANCE instance = GetModuleHandleW(nullptr);
+    if (!g_mouseHook) {
+        g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseRecordProc, instance, 0);
+    }
+    if (!g_keyboardHook) {
+        g_keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardRecordProc, instance, 0);
+    }
+}
+
+void RemoveRecordHooks() {
+    if (g_mouseHook) {
+        UnhookWindowsHookEx(g_mouseHook);
+        g_mouseHook = nullptr;
+    }
+    if (g_keyboardHook) {
+        UnhookWindowsHookEx(g_keyboardHook);
+        g_keyboardHook = nullptr;
+    }
+}
+
+void StartRecording() {
+    if (g_recording.exchange(true, std::memory_order_relaxed)) {
+        return;
+    }
+
+    StopClicker();
+    {
+        std::lock_guard<std::mutex> lock(g_recordMutex);
+        g_recordedActions.clear();
+        g_lastRecordTick = 0;
+        g_hasRecordedMousePoint = false;
+        g_lastRecordedMousePoint = {};
+    }
+    InstallRecordHooks();
+    if (g_recordButton) {
+        SetWindowTextW(g_recordButton, L"停止录制 (F7)");
+    }
+    SetStatusText(L"状态: 正在录制键鼠轨迹和按键 - F7 停止");
+}
+
+void StopRecording() {
+    if (!g_recording.exchange(false, std::memory_order_relaxed)) {
+        return;
+    }
+
+    RemoveRecordHooks();
+    std::vector<ActionSpec> actions;
+    {
+        std::lock_guard<std::mutex> lock(g_recordMutex);
+        actions = g_recordedActions;
+        g_recordedActions.clear();
+    }
+
+    if (!actions.empty()) {
+        g_comboSteps = std::move(actions);
+        g_selectedComboIndex = 0;
+        g_operationMode.store(static_cast<int>(OperationMode::Combo), std::memory_order_relaxed);
+        CheckRadioButton(g_mainWindow, kModeSingleId, kModeComboId, kModeComboId);
+        ShowWindow(g_comboListBox, SW_SHOW);
+        ShowWindow(g_comboAddButton, SW_SHOW);
+        ShowWindow(g_comboRemoveButton, SW_SHOW);
+        ShowWindow(g_comboClearButton, SW_SHOW);
+        RefreshComboListBox();
+        LoadActionIntoEditor(g_comboSteps.front());
+        UpdateModeUi();
+        BuildStatusMessage(L"状态: 录制完成");
+    } else {
+        BuildStatusMessage(L"状态: 未录制到动作");
+    }
+
+    if (g_recordButton) {
+        SetWindowTextW(g_recordButton, L"录制 (F7)");
+    }
+}
+
+void ToggleRecording() {
+    if (g_recording.load(std::memory_order_relaxed)) {
+        StopRecording();
+    } else {
+        StartRecording();
     }
 }
 
@@ -645,7 +930,7 @@ void BuildStatusMessage(const wchar_t* prefix) {
         status += L")";
     }
 
-    status += L" - F6 切换, F8 退出";
+    status += L" - F6 切换, F7 录制, F8 退出";
     SetStatusText(status);
 }
 
@@ -689,7 +974,12 @@ void ClickLoop() {
 
         while (g_running.load(std::memory_order_relaxed) && !g_shouldExit.load(std::memory_order_relaxed)) {
             for (const ActionSpec& action : g_runtimeActions) {
-                SendAction(action);
+                if (!SendAction(action)) {
+                    break;
+                }
+            }
+            if (!g_running.load(std::memory_order_relaxed) || g_shouldExit.load(std::memory_order_relaxed)) {
+                break;
             }
             nextTick += std::chrono::duration_cast<clock::duration>(interval);
 
@@ -715,6 +1005,10 @@ void ClickLoop() {
 }
 
 void StartClicker() {
+    if (g_recording.load(std::memory_order_relaxed)) {
+        StopRecording();
+    }
+
     if (g_running.exchange(true, std::memory_order_relaxed)) {
         return;
     }
@@ -774,6 +1068,25 @@ void CleanupWorkerThread() {
     }
 }
 
+void EnableDpiAwareness() {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32) {
+        using SetProcessDpiAwarenessContextFn = BOOL (WINAPI*)(DPI_AWARENESS_CONTEXT);
+        auto setContext = reinterpret_cast<SetProcessDpiAwarenessContextFn>(
+            GetProcAddress(user32, "SetProcessDpiAwarenessContext"));
+        if (setContext && setContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) {
+            return;
+        }
+
+        using SetProcessDPIAwareFn = BOOL (WINAPI*)();
+        auto setAware = reinterpret_cast<SetProcessDPIAwareFn>(
+            GetProcAddress(user32, "SetProcessDPIAware"));
+        if (setAware) {
+            setAware();
+        }
+    }
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
@@ -803,12 +1116,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                          WS_CHILD | WS_VISIBLE | LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP,
                          22, 154, 146, 108, hwnd, reinterpret_cast<HMENU>(kComboListId),
                          GetModuleHandleW(nullptr), nullptr);
-        g_comboAddButton = CreateWindowExW(0, L"BUTTON", L"添加按键", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                           22, 268, 68, 24, hwnd, reinterpret_cast<HMENU>(kComboAddId),
+        g_comboAddButton = CreateWindowExW(0, L"BUTTON", L"添加", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                           22, 268, 46, 24, hwnd, reinterpret_cast<HMENU>(kComboAddId),
                            GetModuleHandleW(nullptr), nullptr);
-        g_comboRemoveButton = CreateWindowExW(0, L"BUTTON", L"删除按键", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                              96, 268, 68, 24, hwnd, reinterpret_cast<HMENU>(kComboRemoveId),
+        g_comboRemoveButton = CreateWindowExW(0, L"BUTTON", L"删除", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                              72, 268, 46, 24, hwnd, reinterpret_cast<HMENU>(kComboRemoveId),
                               GetModuleHandleW(nullptr), nullptr);
+        g_comboClearButton = CreateWindowExW(0, L"BUTTON", L"清空", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                             122, 268, 42, 24, hwnd, reinterpret_cast<HMENU>(kComboClearId),
+                             GetModuleHandleW(nullptr), nullptr);
 
         g_radioLeft = CreateWindowExW(0, L"BUTTON", L"鼠标左键", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON,
                                       190, 156, 96, 20, hwnd, reinterpret_cast<HMENU>(kRadioLeftId),
@@ -847,8 +1163,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             618, 108, 96, 28, hwnd, reinterpret_cast<HMENU>(kStopButtonId),
             GetModuleHandleW(nullptr), nullptr);
 
+        g_recordButton = CreateWindowExW(0, L"BUTTON", L"录制 (F7)", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            514, 148, 200, 28, hwnd, reinterpret_cast<HMENU>(kRecordButtonId),
+            GetModuleHandleW(nullptr), nullptr);
+
         g_statusText = CreateWindowExW(0, L"STATIC",
-                           L"状态: 已停止 - 模式: 单键连点 - F6 切换, F8 退出",
+                           L"状态: 已停止 - 模式: 单键连点 - F6 切换, F7 录制, F8 退出",
                                        WS_CHILD | WS_VISIBLE, 16, 316, 700, 20, hwnd,
                            reinterpret_cast<HMENU>(kStatusTextId), GetModuleHandleW(nullptr), nullptr);
 
@@ -862,6 +1182,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         ApplyFontToChildren(hwnd);
 
         RegisterHotKey(hwnd, kHotkeyToggleId, MOD_NOREPEAT, VK_F6);
+        RegisterHotKey(hwnd, kHotkeyRecordId, MOD_NOREPEAT, VK_F7);
         RegisterHotKey(hwnd, kHotkeyQuitId, MOD_NOREPEAT, VK_F8);
         ApplyOperationMode(OperationMode::Single);
         EnsureWorkerThread();
@@ -873,6 +1194,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             StartClicker();
         } else if (commandId == kStopButtonId) {
             StopClicker();
+        } else if (commandId == kRecordButtonId) {
+            ToggleRecording();
         } else if (commandId == kModeSingleId) {
             ApplyOperationMode(OperationMode::Single);
         } else if (commandId == kModeComboId) {
@@ -888,6 +1211,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             AddComboStep();
         } else if (commandId == kComboRemoveId && HIWORD(wParam) == BN_CLICKED) {
             RemoveComboStep();
+        } else if (commandId == kComboClearId && HIWORD(wParam) == BN_CLICKED) {
+            StopClicker();
+            ClearComboSteps();
         } else if (commandId == kEditCpsId && HIWORD(wParam) == EN_CHANGE) {
             NormalizeCpsText(g_editCps);
         }
@@ -901,6 +1227,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             } else {
                 StartClicker();
             }
+        } else if (hotkeyId == kHotkeyRecordId) {
+            ToggleRecording();
         } else if (hotkeyId == kHotkeyQuitId) {
             DestroyWindow(hwnd);
         }
@@ -911,7 +1239,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_DESTROY:
         UnregisterHotKey(hwnd, kHotkeyToggleId);
+        UnregisterHotKey(hwnd, kHotkeyRecordId);
         UnregisterHotKey(hwnd, kHotkeyQuitId);
+        RemoveRecordHooks();
         CleanupWorkerThread();
         if (g_uiFont != nullptr) {
             DeleteObject(g_uiFont);
@@ -926,6 +1256,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }  // namespace
 
 int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
+    EnableDpiAwareness();
     const wchar_t* className = L"HighFrequencyClickerWindow";
 
     NONCLIENTMETRICSW metrics = {};
